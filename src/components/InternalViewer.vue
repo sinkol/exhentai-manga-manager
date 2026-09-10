@@ -246,6 +246,8 @@ const closeComicReader = () => {
     ComicReader = null
     const comicReadElement = document.getElementById('ComicRead')
     if (comicReadElement) comicReadElement.remove()
+    ipcRenderer.invoke('release-sendimagelock')
+    ipcRenderer.invoke('clear-viewer-cache')
     ipcRenderer.invoke('update-window-title')
   }
 }
@@ -416,13 +418,14 @@ const viewManga = (book, viewerHeight = '100%') => {
   emit('updateWindowTitle', book)
   insertLocalReadRecord(book.id)
   ipcRenderer.invoke('load-manga-image-list', _.cloneDeep(book))
-  .then(() => {
+  .then(async () => {
     if (!setting.value.viewerType || setting.value.viewerType === 'original') {
       drawerVisibleViewer.value = true
       if (setting.value.keepReadingProgress && showThumbnail.value === false) handleJumpToReadingProgress(book)
       viewerLoading.close()
     } else if (setting.value.viewerType === 'comicread') {
-      initComicRead()
+      await initComicRead()
+      if (viewerImageList.value.length > 0) showComicReader(viewerImageFilepathList.value)
     }
     book.readCount += 1
     saveBook(book)
@@ -737,6 +740,7 @@ const useNewCover = async (filepath) => {
 const handleStopReadManga = () => {
   if (setting.value.keepReadingProgress) saveReadingProgress()
   ipcRenderer.invoke('release-sendimagelock')
+  ipcRenderer.invoke('clear-viewer-cache')
   ipcRenderer.invoke('update-window-title')
 }
 

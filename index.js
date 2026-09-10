@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session, dialog, shell, screen, Menu, clipboard, nativeImage, Tray } = require('electron')
+const { app, BrowserWindow, ipcMain, session, dialog, shell, screen, Menu, clipboard, nativeImage, Tray, protocol, net } = require('electron')
 const path = require('path')
 const fs = require('fs')
 const { brotliDecompress } = require('zlib')
@@ -8,6 +8,7 @@ const { nanoid } = require('nanoid')
 const sharp = require('sharp')
 const { exec } = require('child_process')
 const { createHash } = require('crypto')
+const { pathToFileURL } = require('url')
 const sqlite3 = require('sqlite3')
 const { open } = require('sqlite')
 const fetch = require('node-fetch')
@@ -18,7 +19,7 @@ const { globSync } = require('glob')
 
 const { prepareMangaModel, prepareMetadataModel } = require('./modules/database')
 const { prepareTemplate } = require('./modules/prepare_menu.js')
-const { getBookFilelist, geneCover, getImageListByBook, deleteImageFromBook } = require('./fileLoader/index.js')
+const { getBookFilelist, geneCover, getImageListByBook, getImageEntriesByBook, extractArchiveEntries, extractZipEntryToFile, extractZipEntriesToDir, deleteImageFromBook } = require('./fileLoader/index.js')
 const {
   STORE_PATH, isPortable,
   TEMP_PATH, COVER_PATH, VIEWER_PATH,
@@ -86,6 +87,8 @@ let mainWindow
 let tray
 let screenWidth
 let sendImageLock = false
+// 当前阅读会话状态：{ book, entries, root, prepared, preparing }
+let viewerState = null
 
 const createTray = () => {
   if (tray) return
@@ -204,7 +207,27 @@ const createWindow = () => {
 
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=65536')
 // app.disableHardwareAcceleration()
+// 自定义协议用于按需解压的图片（见 prepareMangaImageByIndex）
+protocol.registerSchemesAsPrivileged([{
+  scheme: 'emm',
+  privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, bypassCSP: true }
+}])
 app.whenReady().then(async () => {
+  protocol.handle('emm', async (request) => {
+    try {
+      const segments = new URL(request.url).pathname.split('/').filter(Boolean)
+      const index = Number(segments[segments.length - 1])
+      const filepath = await prepareMangaImageByIndex(index)
+      if (!filepath) return new Response('Not found', { status: 404 })
+      const res = await net.fetch(pathToFileURL(filepath).toString())
+      const headers = new Headers(res.headers)
+      headers.set('Access-Control-Allow-Origin', '*')
+      return new Response(res.body, { status: 200, headers })
+    } catch (e) {
+      console.log(e)
+      return new Response('Error', { status: 500 })
+    }
+  })
   const primaryDisplay = screen.getPrimaryDisplay()
   screenWidth = Math.floor(primaryDisplay.workAreaSize.width * primaryDisplay.scaleFactor)
   mainWindow = createWindow()
@@ -228,6 +251,17 @@ app.on('ready', async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
+  }
+})
+
+// 退出时清理解压缓存
+app.on('will-quit', () => {
+  for (const folder of [VIEWER_PATH, TEMP_PATH]) {
+    try {
+      fs.rmSync(folder, { recursive: true, force: true })
+    } catch (e) {
+      console.log(e)
+    }
   }
 })
 
@@ -376,7 +410,7 @@ ipcMain.handle('load-book-list', async (event, scan) => {
                 bundleSize,
                 mtime: mtime.toJSON(),
                 coverHash,
-                status: 'non-tag',
+                status: null,
                 exist: true,
                 date: Date.now()
               }
@@ -460,7 +494,7 @@ ipcMain.handle('force-gene-book-list', async (event, arg) => {
           bundleSize,
           mtime: mtime.toJSON(),
           coverHash,
-          status: 'non-tag',
+          status: null,
           date: Date.now()
         })
       }
@@ -666,10 +700,15 @@ ipcMain.handle('show-file', async (event, filepath) => {
 })
 
 ipcMain.handle('use-new-cover', async (event, filepath) => {
-  const copyTempCoverPath = path.join(TEMP_PATH, nanoid(8) + path.extname(filepath))
-  const coverPath = path.join(COVER_PATH, nanoid() + path.extname(filepath))
+  const resolvedPath = await resolveImagePath(filepath)
+  if (!resolvedPath) {
+    sendMessageToWebContents(`Generate cover from ${filepath} failed`)
+    return
+  }
+  const copyTempCoverPath = path.join(TEMP_PATH, nanoid(8) + path.extname(resolvedPath))
+  const coverPath = path.join(COVER_PATH, nanoid() + path.extname(resolvedPath))
   try {
-    await fs.promises.copyFile(filepath, copyTempCoverPath)
+    await fs.promises.copyFile(resolvedPath, copyTempCoverPath)
     await sharp(copyTempCoverPath, { failOnError: false })
     .resize(500, 707, {
       fit: 'contain',
@@ -747,74 +786,214 @@ ipcMain.handle('move-local-book', async (event, oldPath, folderArr) => {
 })
 
 // viewer
-ipcMain.handle('load-manga-image-list', async (event, book) => {
+const sendViewerImage = (bookId, index, relativePath, filepath, width, height, total) => {
+  mainWindow.webContents.send('manga-image', {
+    id: `${bookId}_${index}`,
+    index,
+    relativePath,
+    filepath,
+    width, height,
+    total
+  })
+}
+
+const sendViewerThumbnail = (bookId, index, relativePath, filepath, thumbnailPath, total) => {
+  mainWindow.webContents.send('manga-thumbnail-image', {
+    id: `${bookId}_${index}`,
+    thumbId: `thumb_${bookId}_${index}`,
+    index,
+    relativePath,
+    filepath,
+    thumbnailPath,
+    total
+  })
+}
+
+// 按需解压：把指定页解压到本次阅读的会话目录并返回本地路径
+// 定义为函数声明以便 emm:// 协议处理器提前引用
+async function prepareMangaImageByIndex (index) {
+  const state = viewerState
+  if (!state || !state.lazy) return null
+  const entry = state.entries[index - 1]
+  if (!entry) return null
+  if (state.prepared.has(index)) return state.prepared.get(index)
+  if (state.preparing.has(index)) return state.preparing.get(index)
+  const task = (async () => {
+    try {
+      let imageFilepath
+      if (state.book.type === 'zip') {
+        fs.mkdirSync(state.root, { recursive: true })
+        imageFilepath = path.join(state.root, `img_${entry.entryIndex}${path.extname(entry.relativePath)}`)
+        await extractZipEntryToFile(state.book.filepath, entry.entryIndex, imageFilepath)
+      } else {
+        await extractArchiveEntries(state.book.filepath, [entry.relativePath], state.root)
+        imageFilepath = path.join(state.root, entry.relativePath)
+      }
+      const extname = path.extname(imageFilepath)
+      if (imageFilepath.search(/[%#?]/) >= 0) {
+        const safePath = path.join(VIEWER_PATH, `rename_${nanoid(8)}${extname}`)
+        await fs.promises.copyFile(imageFilepath, safePath)
+        imageFilepath = safePath
+      }
+      const widthLimit = _.isNumber(setting.widthLimit) ? Math.ceil(setting.widthLimit) : screenWidth
+      if (extname !== '.gif' && widthLimit !== 0 && entry.width > widthLimit) {
+        const resizedFilepath = path.join(VIEWER_PATH, `resized_${nanoid(8)}.jpg`)
+        await sharp(imageFilepath, { failOnError: false }).resize({ width: widthLimit }).toFile(resizedFilepath)
+        imageFilepath = resizedFilepath
+      }
+      state.prepared.set(index, imageFilepath)
+      return imageFilepath
+    } finally {
+      state.preparing.delete(index)
+    }
+  })()
+  state.preparing.set(index, task)
+  return task
+}
+
+// 将 emm:// 协议地址解析成本地文件路径
+const resolveImagePath = async (filepath) => {
+  if (typeof filepath === 'string' && filepath.startsWith('emm://')) {
+    const segments = new URL(filepath).pathname.split('/').filter(Boolean)
+    return await prepareMangaImageByIndex(Number(segments[segments.length - 1]))
+  }
+  return filepath
+}
+
+// 关闭阅读器时清理本次会话解压出来的图片
+ipcMain.handle('clear-viewer-cache', async () => {
+  sendImageLock = false
+  viewerState = null
   await clearFolder(VIEWER_PATH)
+  return true
+})
+
+ipcMain.handle('load-manga-image-list', async (event, book) => {
+  sendImageLock = false
+  await clearFolder(VIEWER_PATH)
+  viewerState = null
 
   const { filepath, type, id: bookId } = book
-  const list = await getImageListByBook(filepath, type)
+  // 384 is the default 4K screen width divided by the default number of thumbnail columns
+  const thumbnailWidth = _.isFinite(screenWidth / setting.thumbnailColumn) ? Math.floor(screenWidth / setting.thumbnailColumn) : 384
+  const widthLimit = _.isNumber(setting.widthLimit) ? Math.ceil(setting.widthLimit) : screenWidth
 
+  // 压缩包：先只列出条目，原图在阅读时按需解压
+  if (type === 'zip' || type === 'archive' || !type) {
+    let entries
+    try {
+      entries = await getImageEntriesByBook(filepath, type)
+    } catch (e) {
+      console.log(e)
+    }
+    const totalSize = (entries || []).reduce((sum, entry) => sum + (entry.size || 0), 0)
+    if (entries && entries.length > 0) {
+      viewerState = { book, lazy: true, entries, totalSize, root: path.join(VIEWER_PATH, nanoid(8)), prepared: new Map(), preparing: new Map() }
+      if (setting.viewerType === 'comicread') {
+        // 外部阅读器自行按需加载，无需预先读取尺寸和缩略图
+        entries.forEach((entry, i) => sendViewerImage(bookId, i + 1, entry.relativePath, `emm://image/${bookId}/${i + 1}`, 0, 0, entries.length))
+        return entries.map(entry => ({ relativePath: entry.relativePath }))
+      }
+      sendImageLock = true
+      ;(async () => {
+        // 分批解压只为读取尺寸、生成缩略图，原图按需解压
+        const batchSize = 40
+        for (let start = 0; start < entries.length && sendImageLock; start += batchSize) {
+          const batch = entries.slice(start, start + batchSize)
+          const batchDir = path.join(TEMP_PATH, nanoid(8))
+          try {
+            let extractedMap = null
+            if (type === 'zip') {
+              fs.mkdirSync(batchDir, { recursive: true })
+              extractedMap = await extractZipEntriesToDir(filepath, batch.map(entry => ({ entryIndex: entry.entryIndex, ext: path.extname(entry.relativePath) })), batchDir)
+            } else {
+              await extractArchiveEntries(filepath, batch.map(entry => entry.relativePath), batchDir)
+            }
+            for (let offset = 0; offset < batch.length && sendImageLock; offset++) {
+              const entry = batch[offset]
+              const index = start + offset + 1
+              const extracted = extractedMap ? extractedMap.get(entry.entryIndex) : path.join(batchDir, entry.relativePath)
+              if (!extracted) continue
+              try {
+                const { width, height } = await sharp(extracted, { failOnError: false }).metadata()
+                entry.width = width
+                entry.height = height
+                sendViewerImage(bookId, index, entry.relativePath, `emm://image/${bookId}/${index}`, width, height, entries.length)
+                ;(async () => {
+                  try {
+                    let thumbnailPath = path.join(VIEWER_PATH, `thumb_${nanoid(8)}.jpg`)
+                    if (path.extname(extracted) === '.gif') {
+                      thumbnailPath = path.join(VIEWER_PATH, `thumb_${nanoid(8)}.gif`)
+                      await fs.promises.copyFile(extracted, thumbnailPath)
+                    } else {
+                      await sharp(extracted, { failOnError: false }).resize({ width: thumbnailWidth }).toFile(thumbnailPath)
+                    }
+                    sendViewerThumbnail(bookId, index, entry.relativePath, `emm://image/${bookId}/${index}`, thumbnailPath, entries.length)
+                  } catch (e) {
+                    console.log(`thumbnail ${entry.relativePath} failed because ${e}`)
+                  }
+                })()
+              } catch (e) {
+                console.log(`process ${entry.relativePath} failed because ${e}`)
+              }
+            }
+          } catch (e) {
+            console.log(`extract ${filepath} failed because ${e}`)
+          } finally {
+            await fs.promises.rm(batchDir, { recursive: true, force: true })
+          }
+        }
+        sendImageLock = false
+      })()
+      return entries.map(entry => ({ relativePath: entry.relativePath }))
+    }
+  }
+
+  // 文件夹或较小的压缩包：一次性解压
+  const list = await getImageListByBook(filepath, type)
   sendImageLock = true
   ;(async () => {
-    // 384 is the default 4K screen width divided by the default number of thumbnail columns
-    const thumbnailWidth = _.isFinite(screenWidth / setting.thumbnailColumn) ? Math.floor(screenWidth / setting.thumbnailColumn) : 384
-    const widthLimit = _.isNumber(setting.widthLimit) ? Math.ceil(setting.widthLimit) : screenWidth
     for (let index = 1; index <= list.length; index++) {
-      if (sendImageLock) {
-        let imageFilepath = list[index - 1].absolutePath
-        const extname = path.extname(imageFilepath)
-        if (imageFilepath.search(/[%#]/) >= 0 || type === 'folder') {
-          const newFilepath = path.join(VIEWER_PATH, `rename_${nanoid(8)}${extname}`)
-          await fs.promises.copyFile(imageFilepath, newFilepath)
-          imageFilepath = newFilepath
+      if (!sendImageLock) break
+      let imageFilepath = list[index - 1].absolutePath
+      const extname = path.extname(imageFilepath)
+      if (imageFilepath.search(/[%#]/) >= 0 || type === 'folder') {
+        const newFilepath = path.join(VIEWER_PATH, `rename_${nanoid(8)}${extname}`)
+        await fs.promises.copyFile(imageFilepath, newFilepath)
+        imageFilepath = newFilepath
+      }
+      let { width, height } = await sharp(imageFilepath, { failOnError: false }).metadata()
+      if (widthLimit !== 0 && width > widthLimit) {
+        height = Math.floor(height * (widthLimit / width))
+        width = widthLimit
+        const resizedFilepath = path.join(VIEWER_PATH, `resized_${nanoid(8)}.jpg`)
+        switch (extname) {
+          case '.gif':
+            break
+          default:
+            await sharp(imageFilepath, { failOnError: false })
+              .resize({ width })
+              .toFile(resizedFilepath)
+            imageFilepath = resizedFilepath
+            break
         }
-        let { width, height } = await sharp(imageFilepath, { failOnError: false }).metadata()
-        if (widthLimit !== 0 && width > widthLimit) {
-          height = Math.floor(height * (widthLimit / width))
-          width = widthLimit
-          const resizedFilepath = path.join(VIEWER_PATH, `resized_${nanoid(8)}.jpg`)
+      }
+      sendViewerImage(bookId, index, list[index - 1].relativePath, imageFilepath, width, height, list.length)
+      if (setting.viewerType !== 'comicread') {
+        ;(async () => {
+          let thumbnailPath = path.join(VIEWER_PATH, `thumb_${nanoid(8)}.jpg`)
           switch (extname) {
             case '.gif':
+              thumbnailPath = imageFilepath
               break
             default:
               await sharp(imageFilepath, { failOnError: false })
-                .resize({ width })
-                .toFile(resizedFilepath)
-              imageFilepath = resizedFilepath
+                .resize({ width: thumbnailWidth })
+                .toFile(thumbnailPath)
               break
           }
-        }
-        mainWindow.webContents.send('manga-image', {
-          id: `${bookId}_${index}`,
-          index,
-          relativePath: list[index - 1].relativePath,
-          filepath: imageFilepath,
-          width, height,
-          total: list.length
-        })
-        if (setting.viewerType !== 'comicread') {
-          ;(async () => {
-            let thumbnailPath = path.join(VIEWER_PATH, `thumb_${nanoid(8)}.jpg`)
-            switch (extname) {
-              case '.gif':
-                thumbnailPath = imageFilepath
-                break
-              default:
-                await sharp(imageFilepath, { failOnError: false })
-                  .resize({ width: thumbnailWidth })
-                  .toFile(thumbnailPath)
-                break
-            }
-            mainWindow.webContents.send('manga-thumbnail-image', {
-              id: `${bookId}_${index}`,
-              thumbId: `thumb_${bookId}_${index}`,
-              index,
-              relativePath: list[index - 1].relativePath,
-              filepath: imageFilepath,
-              thumbnailPath,
-              total: list.length
-            })
-          })()
-        }
+          sendViewerThumbnail(bookId, index, list[index - 1].relativePath, imageFilepath, thumbnailPath, list.length)
+        })()
       }
     }
   })()
@@ -1016,7 +1195,8 @@ ipcMain.handle('get-locale', async (event, arg) => {
 })
 
 ipcMain.handle('copy-image-to-clipboard', async (event, filepath) => {
-  clipboard.writeImage(nativeImage.createFromPath(filepath))
+  const resolvedPath = await resolveImagePath(filepath)
+  if (resolvedPath) clipboard.writeImage(nativeImage.createFromPath(resolvedPath))
 })
 
 ipcMain.handle('copy-text-to-clipboard', async (event, text) => {
@@ -1295,7 +1475,9 @@ LANBrowsing.get('/api/archives/:hash/thumbnail', async (req, res) => {
 
 let existBook = {
   hash: null,
-  imageList: []
+  filepath: null,
+  type: null,
+  entries: []
 }
 
 // 处理章节列表请求
@@ -1312,16 +1494,19 @@ LANBrowsing.get('/api/archives/:hash/files', async (req, res) => {
 
     await clearFolder(VIEWER_PATH)
     await clearFolder(staticFilePath)
-    const imageList = await getImageListByBook(manga.filepath, manga.type)
+    // 只列条目，不解压
+    const entries = await getImageEntriesByBook(manga.filepath, manga.type)
 
     existBook = {
       hash: manga.hash,
-      imageList: imageList.map(p => p.absolutePath)
+      filepath: manga.filepath,
+      type: manga.type,
+      entries
     }
     // 构造响应数据
     const responseFiles = {
       job: Date.now(), // 示例中的 job 可以是一个随机数或时间戳
-      pages: imageList.map((file, index) => `/api/archives/${manga.hash}/page?path=${index + 1}`)
+      pages: entries.map((file, index) => `/api/archives/${manga.hash}/page?path=${index + 1}`)
     }
 
     res.json(responseFiles)
@@ -1343,28 +1528,42 @@ LANBrowsing.get('/api/archives/:hash/page', async (req, res) => {
     return res.status(404).send('File not found')
   }
 
-  // 获取章节图片列表
   try {
-    let imageList
-    if (manga.hash === existBook.hash) {
-      imageList = existBook.imageList
-    } else {
+    if (manga.hash !== existBook.hash) {
       await clearFolder(VIEWER_PATH)
       await clearFolder(staticFilePath)
-      imageList = await getImageListByBook(manga.filepath, manga.type)
-      imageList = imageList.map(p => p.absolutePath)
-      existBook.hash = manga.hash
-      existBook.imageList = imageList
+      existBook = {
+        hash: manga.hash,
+        filepath: manga.filepath,
+        type: manga.type,
+        entries: await getImageEntriesByBook(manga.filepath, manga.type)
+      }
     }
-    const imageFilePath = imageList[page - 1]
-    if (!imageFilePath) {
+    const entry = existBook.entries[page - 1]
+    if (!entry) {
       return res.status(404).send('Image not found')
+    }
+
+    // 文件夹直接读原文件，压缩包按需解压到临时目录后复制
+    let imageFilePath = entry.absolutePath
+    let extractDir = null
+    if (!imageFilePath) {
+      extractDir = path.join(VIEWER_PATH, nanoid(8))
+      if (manga.type === 'zip') {
+        fs.mkdirSync(extractDir, { recursive: true })
+        imageFilePath = path.join(extractDir, `img_${entry.entryIndex}${path.extname(entry.relativePath)}`)
+        await extractZipEntryToFile(manga.filepath, entry.entryIndex, imageFilePath)
+      } else {
+        await extractArchiveEntries(manga.filepath, [entry.relativePath], extractDir)
+        imageFilePath = path.join(extractDir, entry.relativePath)
+      }
     }
 
     // 重命名并复制图片文件到静态文件夹
     const imageFileName = `${manga.hash}_${page}${path.extname(imageFilePath)}`
     const imageFile = path.join(staticFilePath, imageFileName)
     await fs.promises.copyFile(imageFilePath, imageFile)
+    if (extractDir) await fs.promises.rm(extractDir, { recursive: true, force: true })
 
     // 发送图片文件
     if (fs.existsSync(imageFile)) {

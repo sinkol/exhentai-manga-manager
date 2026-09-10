@@ -696,9 +696,9 @@ export default defineComponent({
         this.buttonGetMetadatasLoading = true
         let bookList
         if (this.setting.batchTagfailedBook) {
-          bookList = this.bookList.filter(book => book.status === 'tag-failed' || book.status === 'non-tag')
+          bookList = this.bookList.filter(book => !book.status || book.status === 'tag-failed')
         } else {
-          bookList = this.bookList.filter(book => book.status === 'non-tag')
+          bookList = this.bookList.filter(book => !book.status)
         }
         if (this.setting.onlyGetMetadataOfSelectedFolder) {
           bookList = bookList.filter(book => !book.folderHide)

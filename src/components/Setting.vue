@@ -28,6 +28,14 @@
           </el-col>
           <el-col :span="24">
             <div class="setting-line">
+              <el-input v-model="setting.cachePath" :placeholder="$t('m.cachePathDefault')">
+                <template #prepend><span class="setting-label">{{$t('m.cachePath')}}</span></template>
+                <template #append><el-button @click="selectCachePath">{{$t('m.select')}}</el-button></template>
+              </el-input>
+            </div>
+          </el-col>
+          <el-col :span="24">
+            <div class="setting-line">
               <el-input v-model="setting.imageExplorer" @change="saveSetting">
                 <template #prepend><span class="setting-label">{{$t('m.imageViewer')}}</span></template>
                 <template #append>
@@ -555,6 +563,17 @@ const selectMetadataPath = () => {
   .then(res => {
     setting.value.metadataPath = res
     saveSetting()
+  })
+}
+
+const selectCachePath = () => {
+  ipcRenderer.invoke('select-folder', t('m.cachePath'))
+  .then(res => {
+    if (res) {
+      setting.value.cachePath = res
+      saveSetting()
+      printMessage('info', t('m.cachePathRestart'))
+    }
   })
 }
 

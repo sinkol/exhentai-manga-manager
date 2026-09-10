@@ -25,14 +25,31 @@ try {
   }
 }
 
-const TEMP_PATH = path.join(STORE_PATH, 'tmp')
+// 解压/阅读缓存目录，可通过 setting.json 的 cachePath 或环境变量 EMM_CACHE_PATH 配置
+const getCachePath = () => {
+  if (process.env.EMM_CACHE_PATH) return process.env.EMM_CACHE_PATH
+  try {
+    const cachePath = JSON.parse(fs.readFileSync(path.join(STORE_PATH, 'setting.json'), { encoding: 'utf-8' })).cachePath
+    if (cachePath && typeof cachePath === 'string' && cachePath.trim()) return cachePath.trim()
+  } catch {
+    // setting.json 不存在或不可读时使用默认位置
+  }
+  return STORE_PATH
+}
+
+const CACHE_PATH = getCachePath()
+const TEMP_PATH = path.join(CACHE_PATH, 'tmp')
 const COVER_PATH = path.join(STORE_PATH, 'cover')
-const VIEWER_PATH = path.join(STORE_PATH, 'viewer')
+const VIEWER_PATH = path.join(CACHE_PATH, 'viewer')
 
 const preparePath = () => {
-  fs.mkdirSync(TEMP_PATH, { recursive: true })
-  fs.mkdirSync(COVER_PATH, { recursive: true })
-  fs.mkdirSync(VIEWER_PATH, { recursive: true })
+  for (const folder of [TEMP_PATH, COVER_PATH, VIEWER_PATH]) {
+    try {
+      fs.mkdirSync(folder, { recursive: true })
+    } catch (e) {
+      console.log(e)
+    }
+  }
 }
 
 const _mange_reader = `"${path.join(getRootPath(), 'resources/extraResources/manga_reader.exe')}"`
@@ -74,6 +91,7 @@ const prepareSetting = () => {
       skipDeleteConfirm: false,
       displayTitle: 'japaneseTitle',
       keepReadingProgress: true,
+      cachePath: '',
     }
     fs.writeFileSync(path.join(STORE_PATH, 'setting.json'), JSON.stringify(setting, null, '  '), { encoding: 'utf-8' })
   }
@@ -94,6 +112,7 @@ const prepareCollectionList = () => {
 module.exports = {
   STORE_PATH,
   isPortable,
+  CACHE_PATH,
   TEMP_PATH,
   COVER_PATH,
   VIEWER_PATH,
