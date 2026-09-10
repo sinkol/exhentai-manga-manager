@@ -27,6 +27,7 @@ temp
 *.njsproj
 *.sln
 *.sw?
+*.bak
 
 .vscode
 devtools

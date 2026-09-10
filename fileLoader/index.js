@@ -4,8 +4,8 @@ const { nanoid } = require('nanoid')
 const { createHash } = require('crypto')
 const sharp = require('sharp')
 const { getFolderlist, solveBookTypeFolder, getImageListFromFolder, deleteImageFromFolder } = require('./folder.js')
-const { getArchivelist, solveBookTypeArchive, getImageListFromArchive, deleteImageFromArchive } = require('./archive.js')
-const { getZipFilelist, solveBookTypeZip } = require('./zip.js')
+const { getArchivelist, solveBookTypeArchive, getImageListFromArchive, getArchiveImageEntries, extractArchiveEntries, deleteImageFromArchive } = require('./archive.js')
+const { getZipFilelist, solveBookTypeZip, getZipImageEntries, extractZipEntryToFile, extractZipEntriesToDir } = require('./zip.js')
 const { TEMP_PATH, COVER_PATH, VIEWER_PATH } = require('../modules/init_folder_setting.js')
 
 const getBookFilelist = async (library) => {
@@ -30,7 +30,7 @@ const geneCover = async (filepath, type) => {
         ;({ targetFilePath, coverPath, tempCoverPath, pageCount, bundleSize, mtime } = await solveBookTypeArchive(filepath, TEMP_PATH, COVER_PATH))
       } catch (e) {
         console.log(e)
-        console.log(`reload ${filepath} use adm-zip`)
+        console.log(`reload ${filepath} use yauzl`)
         ;({ targetFilePath, coverPath, tempCoverPath, pageCount, bundleSize, mtime } = await solveBookTypeZip(filepath, TEMP_PATH, COVER_PATH))
       }
       break
@@ -63,6 +63,19 @@ const getImageListByBook = async (filepath, type) => {
   }
 }
 
+// 只列出图片，不解压（用于按需解压）
+const getImageEntriesByBook = async (filepath, type) => {
+  switch (type) {
+    case 'folder':
+      return (await getImageListFromFolder(filepath, VIEWER_PATH)).map(f => ({ relativePath: f.relativePath, absolutePath: f.absolutePath }))
+    case 'zip':
+      return await getZipImageEntries(filepath)
+    case 'archive':
+    default:
+      return await getArchiveImageEntries(filepath)
+  }
+}
+
 const deleteImageFromBook = async (filename, filepath, type) => {
   switch (type) {
     case 'folder':
@@ -79,5 +92,9 @@ module.exports = {
   getBookFilelist,
   geneCover,
   getImageListByBook,
+  getImageEntriesByBook,
+  extractArchiveEntries,
+  extractZipEntryToFile,
+  extractZipEntriesToDir,
   deleteImageFromBook
 }
