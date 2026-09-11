@@ -19,7 +19,7 @@ const { globSync } = require('glob')
 
 const { prepareMangaModel, prepareMetadataModel } = require('./modules/database')
 const { prepareTemplate } = require('./modules/prepare_menu.js')
-const { getBookFilelist, geneCover, getImageListByBook, getImageEntriesByBook, extractArchiveEntries, extractZipEntryToFile, extractZipEntriesToDir, deleteImageFromBook } = require('./fileLoader/index.js')
+const { getBookFilelist, geneCover, getImageListByBook, getImageEntriesByBook, extractArchiveEntries, extractZipEntryToFile, extractZipEntriesToDir, extractPdfPageToFile, extractPdfPagesToDir, deleteImageFromBook } = require('./fileLoader/index.js')
 const {
   STORE_PATH, isPortable,
   TEMP_PATH, COVER_PATH, VIEWER_PATH,
@@ -825,6 +825,12 @@ async function prepareMangaImageByIndex (index) {
         fs.mkdirSync(state.root, { recursive: true })
         imageFilepath = path.join(state.root, `img_${entry.entryIndex}${path.extname(entry.relativePath)}`)
         await extractZipEntryToFile(state.book.filepath, entry.entryIndex, imageFilepath)
+      } else if (state.book.type === 'pdf') {
+        // PDF 按需渲染当前页，宽度上限即设置的 widthLimit
+        const pdfWidthLimit = _.isNumber(setting.widthLimit) ? Math.ceil(setting.widthLimit) : screenWidth
+        fs.mkdirSync(state.root, { recursive: true })
+        imageFilepath = path.join(state.root, `page_${entry.entryIndex}.jpg`)
+        await extractPdfPageToFile(state.book.filepath, entry.entryIndex, imageFilepath, { maxWidth: pdfWidthLimit })
       } else {
         await extractArchiveEntries(state.book.filepath, [entry.relativePath], state.root)
         imageFilepath = path.join(state.root, entry.relativePath)
@@ -879,7 +885,7 @@ ipcMain.handle('load-manga-image-list', async (event, book) => {
   const widthLimit = _.isNumber(setting.widthLimit) ? Math.ceil(setting.widthLimit) : screenWidth
 
   // 压缩包：先只列出条目，原图在阅读时按需解压
-  if (type === 'zip' || type === 'archive' || !type) {
+  if (type === 'zip' || type === 'archive' || type === 'pdf' || !type) {
     let entries
     try {
       entries = await getImageEntriesByBook(filepath, type)
@@ -906,6 +912,8 @@ ipcMain.handle('load-manga-image-list', async (event, book) => {
             if (type === 'zip') {
               fs.mkdirSync(batchDir, { recursive: true })
               extractedMap = await extractZipEntriesToDir(filepath, batch.map(entry => ({ entryIndex: entry.entryIndex, ext: path.extname(entry.relativePath) })), batchDir)
+            } else if (type === 'pdf') {
+              extractedMap = await extractPdfPagesToDir(filepath, batch, batchDir, { maxWidth: thumbnailWidth })
             } else {
               await extractArchiveEntries(filepath, batch.map(entry => entry.relativePath), batchDir)
             }
@@ -1553,6 +1561,10 @@ LANBrowsing.get('/api/archives/:hash/page', async (req, res) => {
         fs.mkdirSync(extractDir, { recursive: true })
         imageFilePath = path.join(extractDir, `img_${entry.entryIndex}${path.extname(entry.relativePath)}`)
         await extractZipEntryToFile(manga.filepath, entry.entryIndex, imageFilePath)
+      } else if (manga.type === 'pdf') {
+        fs.mkdirSync(extractDir, { recursive: true })
+        imageFilePath = path.join(extractDir, `page_${entry.entryIndex}.jpg`)
+        await extractPdfPageToFile(manga.filepath, entry.entryIndex, imageFilePath, { maxWidth: 1600 })
       } else {
         await extractArchiveEntries(manga.filepath, [entry.relativePath], extractDir)
         imageFilePath = path.join(extractDir, entry.relativePath)

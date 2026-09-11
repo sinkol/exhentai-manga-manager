@@ -762,7 +762,7 @@ const onMangaImageContextMenu = (e, image) => {
           useNewCover(image.filepath)
         }
       },
-      {
+      ...(bookDetail.value.type === 'pdf' ? [] : [{
         label: t('c.deleteImage'),
         onClick: async () => {
           const deleteResult = await ipcRenderer.invoke('delete-image', image.relativePath, bookDetail.value.filepath, bookDetail.value.type)
@@ -774,7 +774,7 @@ const onMangaImageContextMenu = (e, image) => {
             printMessage('error', t('c.deleteImageError'))
           }
         }
-      }
+      }])
     ]
   })
 }

@@ -1,7 +1,7 @@
 {
   "name": "exhentai-manga-manager",
   "private": true,
-  "version": "1.6.16",
+  "version": "1.6.17",
   "author": "SchneeHertz",
   "description": "Tag-based management, reading manga downloaded from ExHentai",
   "repository": {
@@ -43,7 +43,9 @@
     "asarUnpack": [
       "**/*.node",
       "**/node_modules/sqlite3/**",
-      "**/node_modules/sharp/**"
+      "**/node_modules/sharp/**",
+      "**/node_modules/pdfjs-dist/**",
+      "**/node_modules/@napi-rs/canvas*/**"
     ],
     "mac": {
       "target": [
@@ -67,6 +69,7 @@
     }
   },
   "dependencies": {
+    "@napi-rs/canvas": "^0.1.80",
     "electron-window-state": "^5.0.3",
     "express": "^4.19.2",
     "glob": "^10.3.3",
@@ -75,6 +78,7 @@
     "lodash": "^4.17.21",
     "nanoid": "^3.3.2",
     "node-fetch": "^2.7.0",
+    "pdfjs-dist": "^5.4.296",
     "sequelize": "^6.32.1",
     "sharp": "^0.32.6",
     "sqlite": "^4.1.2",

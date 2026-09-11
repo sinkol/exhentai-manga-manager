@@ -55,7 +55,7 @@
 - Sort by upload time, add time, rating
 - Show comments on ExHentai
 - Manga content thumbnails, progress positioning and selection
-- Support unpacked manga folders, zip, rar, 7z packages
+- Support unpacked manga folders, zip, rar, 7z packages, PDF
 - Management of multi-chapter manga collections
 - Hide specified manga
 - Translation of tags into Chinese
